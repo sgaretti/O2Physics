@@ -52,7 +52,7 @@
         "start-value-enumeration": "0",
         "end-value-enumeration": "-1",
         "step-value-enumeration": "1",
-        "aod-file": "AO2D.root"
+        "aod-file": "AO2D_MC_Ds.root"
     },
     "hf-track-index-skim-creator-cascades": {
         "maxDZIni": "4",
