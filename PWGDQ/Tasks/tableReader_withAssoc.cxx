@@ -1205,6 +1205,342 @@ struct AnalysisPrefilterSelection {
   PROCESS_SWITCH(AnalysisPrefilterSelection, processDummy, "Do nothing", true);
 };
 
+struct AnalysisEventMixing {
+  OutputObj<THashList> fOutputList{"output"};
+  // Here one should provide the list of electron and muon candidate cuts in the same order as specified in the above
+  // single particle selection tasks to preserve the correspondence between the track cut name and its
+  //  bit position in the cuts bitmap
+  // TODO: Create a configurable to specify exactly on which of the bits one should run the event mixing
+  Configurable<std::string> fConfigTrackCuts{"cfgTrackCuts", "", "Comma separated list of barrel track cuts"};
+  Configurable<std::string> fConfigMuonCuts{"cfgMuonCuts", "", "Comma separated list of muon cuts"};
+  Configurable<int> fConfigMixingDepth{"cfgMixingDepth", 100, "Number of Events stored for event mixing"};
+  Configurable<std::string> fConfigAddEventMixingHistogram{"cfgAddEventMixingHistogram", "", "Comma separated list of histograms"};
+  Configurable<std::string> ccdburl{"ccdburl", "http://alice-ccdb.cern.ch", "url of the ccdb repository"};
+  Configurable<std::string> grpmagPath{"grpmagPath", "GLO/Config/GRPMagField", "CCDB path of the GRPMagField object"};
+  Configurable<bool> fConfigAmbiguousHist{"cfgAmbiHist", false, "Enable Ambiguous histograms for time association studies"};
+  Configurable<std::string> ccdbPathFlow{"ccdb-path-flow", "Users/c/chizh/FlowResolution", "path to the ccdb object for flow resolution factors"};
+  Configurable<bool> fConfigFlowReso{"cfgFlowReso", false, "Enable loading of flow resolution factors from CCDB"};
+  Configurable<bool> fConfigSingleMuCumulants{"cfgSingleMuCumulants", false, "Enable loading of flow resolution factors from CCDB"};
+  Configurable<std::string> fConfigAddJSONHistograms{"cfgAddJSONHistograms", "", "Histograms in JSON format"};
+
+  Service<o2::ccdb::BasicCCDBManager> ccdb;
+
+  o2::parameters::GRPMagField* grpmag = nullptr;
+  TH1D* ResoFlowSP = nullptr;   // Resolution factors for flow analysis, this will be loaded from CCDB
+  TH1D* ResoFlowEP = nullptr;   // Resolution factors for flow analysis, this will be loaded from CCDB
+  TH2D* SingleMuv22m = nullptr; // Single muon v22, loaded from CCDB
+  TH2D* SingleMuv24m = nullptr; // Single muon v24, loaded from CCDB
+  TH2D* SingleMuv22p = nullptr; // Single antimuon v22, loaded from CCDB
+  TH2D* SingleMuv24p = nullptr; // Single antimuon v24, loaded from CCDB
+  int fCurrentRun;              // needed to detect if the run changed and trigger update of calibrations etc.
+
+  Filter filterEventSelected = aod::dqanalysisflags::isEventSelected == 1;
+  Filter filterTrackSelected = aod::dqanalysisflags::isBarrelSelected > 0;
+  Filter filterMuonTrackSelected = aod::dqanalysisflags::isMuonSelected > 0;
+
+  HistogramManager* fHistMan;
+  // NOTE: The bit mask is required to run pairing just based on the desired electron/muon candidate cuts
+  uint32_t fTwoTrackFilterMask = 0;
+  uint32_t fTwoMuonFilterMask = 0;
+  std::vector<std::vector<TString>> fTrackHistNames;
+  std::vector<std::vector<TString>> fMuonHistNames;
+  std::vector<std::vector<TString>> fTrackMuonHistNames;
+
+  NoBinningPolicy<aod::dqanalysisflags::MixingHash> hashBin;
+
+  void init(o2::framework::InitContext& context)
+  {
+    if (context.mOptions.get<bool>("processDummy")) {
+      return;
+    }
+
+    fCurrentRun = 0;
+
+    ccdb->setURL(ccdburl.value);
+    ccdb->setCaching(true);
+    ccdb->setLocalObjectValidityChecking();
+
+    VarManager::SetDefaultVarNames();
+    fHistMan = new HistogramManager("analysisHistos", "aa", VarManager::kNVars);
+    fHistMan->SetUseDefaultVariableNames(kTRUE);
+    fHistMan->SetDefaultVarNames(VarManager::fgVariableNames, VarManager::fgVariableUnits);
+
+    // Keep track of all the histogram class names to avoid composing strings in the event mixing pairing
+    TString histNames = "";
+    if (context.mOptions.get<bool>("processBarrelSkimmed") || context.mOptions.get<bool>("processBarrelVnSkimmed")) {
+      TString cutNames = fConfigTrackCuts.value;
+      if (!cutNames.IsNull()) {
+        std::unique_ptr<TObjArray> objArray(cutNames.Tokenize(","));
+        for (int icut = 0; icut < objArray->GetEntries(); ++icut) {
+          std::vector<TString> names = {
+            Form("PairsBarrelMEPM_%s", objArray->At(icut)->GetName()),
+            Form("PairsBarrelMEPP_%s", objArray->At(icut)->GetName()),
+            Form("PairsBarrelMEMM_%s", objArray->At(icut)->GetName())};
+          histNames += Form("%s;%s;%s;", names[0].Data(), names[1].Data(), names[2].Data());
+          fTrackHistNames.push_back(names);
+          fTwoTrackFilterMask |= (static_cast<uint32_t>(1) << icut);
+        }
+      }
+    }
+    if (context.mOptions.get<bool>("processMuonSkimmed") || context.mOptions.get<bool>("processMuonVnSkimmed") || context.mOptions.get<bool>("processMuonVnCentrSkimmed") || context.mOptions.get<bool>("processMuonVnExtraSkimmed")) {
+      TString cutNames = fConfigMuonCuts.value;
+      if (!cutNames.IsNull()) {
+        std::unique_ptr<TObjArray> objArray(cutNames.Tokenize(","));
+        for (int icut = 0; icut < objArray->GetEntries(); ++icut) {
+          std::vector<TString> names = {
+            Form("PairsMuonMEPM_%s", objArray->At(icut)->GetName()),
+            Form("PairsMuonMEPP_%s", objArray->At(icut)->GetName()),
+            Form("PairsMuonMEMM_%s", objArray->At(icut)->GetName())};
+          if (fConfigAmbiguousHist) {
+            histNames += Form("%s;%s;%s;%s_unambiguous;%s_unambiguous;%s_unambiguous;", names[0].Data(), names[1].Data(), names[2].Data(), names[0].Data(), names[1].Data(), names[2].Data());
+          } else {
+            histNames += Form("%s;%s;%s;", names[0].Data(), names[1].Data(), names[2].Data());
+          }
+          fMuonHistNames.push_back(names);
+          fTwoMuonFilterMask |= (static_cast<uint32_t>(1) << icut);
+        }
+      }
+    }
+    if (context.mOptions.get<bool>("processBarrelMuonSkimmed")) {
+      TString cutNamesBarrel = fConfigTrackCuts.value;
+      TString cutNamesMuon = fConfigMuonCuts.value;
+      if (!cutNamesBarrel.IsNull() && !cutNamesMuon.IsNull()) {
+        std::unique_ptr<TObjArray> objArrayBarrel(cutNamesBarrel.Tokenize(","));
+        std::unique_ptr<TObjArray> objArrayMuon(cutNamesMuon.Tokenize(","));
+        if (objArrayBarrel->GetEntries() == objArrayMuon->GetEntries()) { // one must specify equal number of barrel and muon cuts
+          for (int icut = 0; icut < objArrayBarrel->GetEntries(); ++icut) {
+            std::vector<TString> names = {
+              Form("PairsEleMuMEPM_%s_%s", objArrayBarrel->At(icut)->GetName(), objArrayMuon->At(icut)->GetName()),
+              Form("PairsEleMuMEPP_%s_%s", objArrayBarrel->At(icut)->GetName(), objArrayMuon->At(icut)->GetName()),
+              Form("PairsEleMuMEMM_%s_%s", objArrayBarrel->At(icut)->GetName(), objArrayMuon->At(icut)->GetName())};
+            histNames += Form("%s;%s;%s;", names[0].Data(), names[1].Data(), names[2].Data());
+            fTrackMuonHistNames.push_back(names);
+            fTwoTrackFilterMask |= (static_cast<uint32_t>(1) << icut);
+            fTwoMuonFilterMask |= (static_cast<uint32_t>(1) << icut);
+          }
+        }
+      }
+    }
+
+    DefineHistograms(fHistMan, histNames.Data(), fConfigAddEventMixingHistogram); // define all histograms
+    // Additional histograms via JSON
+    dqhistograms::AddHistogramsFromJSON(fHistMan, fConfigAddJSONHistograms.value.c_str());
+    VarManager::SetUseVars(fHistMan->GetUsedVars()); // provide the list of required variables so that VarManager knows what to fill
+    fOutputList.setObject(fHistMan->GetMainHistogramList());
+  }
+
+  template <uint32_t TEventFillMap, int TPairType, typename TTracks1, typename TTracks2>
+  void runMixedPairing(TTracks1 const& tracks1, TTracks2 const& tracks2)
+  {
+
+    unsigned int ncuts = fTrackHistNames.size();
+    std::vector<std::vector<TString>> histNames = fTrackHistNames;
+    if constexpr (TPairType == pairTypeMuMu) {
+      ncuts = fMuonHistNames.size();
+      histNames = fMuonHistNames;
+    }
+    if constexpr (TPairType == pairTypeEMu) {
+      ncuts = fTrackMuonHistNames.size();
+      histNames = fTrackMuonHistNames;
+    }
+
+    uint32_t twoTrackFilter = 0;
+    uint32_t mult_dimuons = 0;
+    for (auto& track1 : tracks1) {
+      for (auto& track2 : tracks2) {
+        if constexpr (TPairType == VarManager::kDecayToMuMu) {
+          twoTrackFilter = static_cast<uint32_t>(track1.isMuonSelected()) & static_cast<uint32_t>(track2.isMuonSelected()) & fTwoMuonFilterMask;
+        }
+        if (twoTrackFilter && track1.sign() * track2.sign() < 0) {
+          mult_dimuons++;
+        }
+      } // end for (track2)
+    } // end for (track1)
+    VarManager::fgValues[VarManager::kMultDimuonsME] = mult_dimuons;
+
+    twoTrackFilter = 0;
+    for (auto& track1 : tracks1) {
+      for (auto& track2 : tracks2) {
+        if constexpr (TPairType == VarManager::kDecayToEE) {
+          twoTrackFilter = static_cast<uint32_t>(track1.isBarrelSelected()) & static_cast<uint32_t>(track2.isBarrelSelected()) & fTwoTrackFilterMask;
+        }
+        if constexpr (TPairType == VarManager::kDecayToMuMu) {
+          twoTrackFilter = static_cast<uint32_t>(track1.isMuonSelected()) & static_cast<uint32_t>(track2.isMuonSelected()) & fTwoMuonFilterMask;
+          if (fConfigSingleMuCumulants) {
+            VarManager::FillTwoMixEventsCumulants(SingleMuv22m, SingleMuv24m, SingleMuv22p, SingleMuv24p, track1, track2);
+          }
+        }
+        if constexpr (TPairType == VarManager::kElectronMuon) {
+          twoTrackFilter = static_cast<uint32_t>(track1.isBarrelSelected()) & static_cast<uint32_t>(track2.isMuonSelected()) & fTwoTrackFilterMask;
+        }
+
+        if (!twoTrackFilter) { // the tracks must have at least one filter bit in common to continue
+          continue;
+        }
+        VarManager::FillPairME<TEventFillMap, TPairType>(track1, track2);
+
+        for (unsigned int icut = 0; icut < ncuts; icut++) {
+          if (twoTrackFilter & (static_cast<uint32_t>(1) << icut)) {
+            if (track1.sign() * track2.sign() < 0) {
+              fHistMan->FillHistClass(histNames[icut][0].Data(), VarManager::fgValues);
+              if (fConfigAmbiguousHist && !(track1.isAmbiguous() || track2.isAmbiguous())) {
+                fHistMan->FillHistClass(Form("%s_unambiguous", histNames[icut][0].Data()), VarManager::fgValues);
+              }
+            } else {
+              if (track1.sign() > 0) {
+                fHistMan->FillHistClass(histNames[icut][1].Data(), VarManager::fgValues);
+                if (fConfigAmbiguousHist && !(track1.isAmbiguous() || track2.isAmbiguous())) {
+                  fHistMan->FillHistClass(Form("%s_unambiguous", histNames[icut][1].Data()), VarManager::fgValues);
+                }
+              } else {
+                fHistMan->FillHistClass(histNames[icut][2].Data(), VarManager::fgValues);
+                if (fConfigAmbiguousHist && !(track1.isAmbiguous() || track2.isAmbiguous())) {
+                  fHistMan->FillHistClass(Form("%s_unambiguous", histNames[icut][2].Data()), VarManager::fgValues);
+                }
+              }
+            }
+          } // end if (filter bits)
+        } // end for (cuts)
+      } // end for (track2)
+    } // end for (track1)
+  }
+
+  // barrel-barrel and muon-muon event mixing
+  template <int TPairType, uint32_t TEventFillMap, typename TEvents, typename TTracks>
+  void runSameSide(TEvents& events, TTracks const& tracks, Preslice<TTracks>& preSlice)
+  {
+    if (events.size() > 0 && fCurrentRun != events.begin().runNumber()) {
+      grpmag = ccdb->getForTimeStamp<o2::parameters::GRPMagField>(grpmagPath, events.begin().timestamp());
+      if (grpmag != nullptr) {
+        VarManager::SetMagneticField(grpmag->getNominalL3Field());
+      } else {
+        LOGF(fatal, "GRP object is not available in CCDB at timestamp=%llu", events.begin().timestamp());
+      }
+      if (fConfigFlowReso) {
+        TString PathFlow = ccdbPathFlow.value;
+        TString ccdbPathFlowSP = Form("%s/ScalarProduct", PathFlow.Data());
+        TString ccdbPathFlowEP = Form("%s/EventPlane", PathFlow.Data());
+        ResoFlowSP = ccdb->getForTimeStamp<TH1D>(ccdbPathFlowSP.Data(), events.begin().timestamp());
+        ResoFlowEP = ccdb->getForTimeStamp<TH1D>(ccdbPathFlowEP.Data(), events.begin().timestamp());
+        if (ResoFlowSP == nullptr || ResoFlowEP == nullptr) {
+          LOGF(fatal, "Resolution factor is not available in CCDB at timestamp=%llu", events.begin().timestamp());
+        }
+      }
+      if (fConfigSingleMuCumulants) {
+        TString PathFlow = ccdbPathFlow.value;
+        TString ccdbPathMuv22m = Form("%s/SingleMuv22m", PathFlow.Data());
+        TString ccdbPathMuv24m = Form("%s/SingleMuv24m", PathFlow.Data());
+        TString ccdbPathMuv22p = Form("%s/SingleMuv22p", PathFlow.Data());
+        TString ccdbPathMuv24p = Form("%s/SingleMuv24p", PathFlow.Data());
+        SingleMuv22m = ccdb->getForTimeStamp<TH2D>(ccdbPathMuv22m.Data(), events.begin().timestamp());
+        SingleMuv24m = ccdb->getForTimeStamp<TH2D>(ccdbPathMuv24m.Data(), events.begin().timestamp());
+        SingleMuv22p = ccdb->getForTimeStamp<TH2D>(ccdbPathMuv22p.Data(), events.begin().timestamp());
+        SingleMuv24p = ccdb->getForTimeStamp<TH2D>(ccdbPathMuv24p.Data(), events.begin().timestamp());
+        if (SingleMuv22m == nullptr || SingleMuv24m == nullptr || SingleMuv22p == nullptr || SingleMuv24p == nullptr) {
+          LOGF(fatal, "Single muon cumulants are not available in CCDB at timestamp=%llu", events.begin().timestamp());
+        }
+      }
+      fCurrentRun = events.begin().runNumber();
+    }
+
+    events.bindExternalIndices(&tracks);
+    int mixingDepth = fConfigMixingDepth.value;
+    for (auto& [event1, event2] : selfCombinations(hashBin, mixingDepth, -1, events, events)) {
+      VarManager::ResetValues(0, VarManager::kNVars);
+      VarManager::FillEvent<TEventFillMap>(event1, VarManager::fgValues);
+
+      auto tracks1 = tracks.sliceBy(preSlice, event1.globalIndex());
+      tracks1.bindExternalIndices(&events);
+
+      auto tracks2 = tracks.sliceBy(preSlice, event2.globalIndex());
+      tracks2.bindExternalIndices(&events);
+
+      VarManager::FillTwoMixEvents<TEventFillMap>(event1, event2, tracks1, tracks2);
+      if (fConfigFlowReso) {
+        VarManager::FillTwoMixEventsFlowResoFactor(ResoFlowSP, ResoFlowEP);
+      }
+      runMixedPairing<TEventFillMap, TPairType>(tracks1, tracks2);
+    } // end event loop
+  }
+
+  // barrel-muon event mixing
+  template <uint32_t TEventFillMap, typename TEvents, typename TTracks, typename TMuons>
+  void runBarrelMuon(TEvents& events, TTracks const& tracks, TMuons const& muons)
+  {
+    if (events.size() > 0 && fCurrentRun != events.begin().runNumber()) {
+      grpmag = ccdb->getForTimeStamp<o2::parameters::GRPMagField>(grpmagPath, events.begin().timestamp());
+      if (grpmag != nullptr) {
+        VarManager::SetMagneticField(grpmag->getNominalL3Field());
+      } else {
+        LOGF(fatal, "GRP object is not available in CCDB at timestamp=%llu", events.begin().timestamp());
+      }
+      fCurrentRun = events.begin().runNumber();
+    }
+
+    events.bindExternalIndices(&muons);
+
+    for (auto& [event1, event2] : selfCombinations(hashBin, 100, -1, events, events)) {
+      VarManager::ResetValues(0, VarManager::kNVars);
+      VarManager::FillEvent<TEventFillMap>(event1, VarManager::fgValues);
+
+      auto tracks1 = tracks.sliceBy(perEventsSelectedT, event1.globalIndex());
+      tracks1.bindExternalIndices(&events);
+
+      auto muons2 = muons.sliceBy(perEventsSelectedM, event2.globalIndex());
+      muons2.bindExternalIndices(&events);
+
+      runMixedPairing<TEventFillMap, pairTypeEMu>(tracks1, muons2);
+    } // end event loop
+  }
+
+  Preslice<soa::Filtered<MyBarrelTracksSelected>> perEventsSelectedT = aod::reducedtrack::reducedeventId;
+  Preslice<soa::Filtered<MyMuonTracksSelected>> perEventsSelectedM = aod::reducedmuon::reducedeventId;
+
+  void processBarrelSkimmed(soa::Filtered<MyEventsHashSelected>& events, soa::Filtered<MyBarrelTracksSelected> const& tracks)
+  {
+    runSameSide<pairTypeEE, gkEventFillMap>(events, tracks, perEventsSelectedT);
+  }
+  void processMuonSkimmed(soa::Filtered<MyEventsHashSelected>& events, soa::Filtered<MyMuonTracksSelected> const& muons)
+  {
+    runSameSide<pairTypeMuMu, gkEventFillMap>(events, muons, perEventsSelectedM);
+  }
+  void processBarrelMuonSkimmed(soa::Filtered<MyEventsHashSelected>& events, soa::Filtered<MyBarrelTracksSelected> const& tracks, soa::Filtered<MyMuonTracksSelected> const& muons)
+  {
+    runBarrelMuon<gkEventFillMap>(events, tracks, muons);
+  }
+  void processBarrelVnSkimmed(soa::Filtered<MyEventsHashSelectedQvector>& events, soa::Filtered<MyBarrelTracksSelected> const& tracks)
+  {
+    runSameSide<pairTypeEE, gkEventFillMapWithQvector>(events, tracks, perEventsSelectedT);
+  }
+  void processMuonVnSkimmed(soa::Filtered<MyEventsHashSelectedQvector>& events, soa::Filtered<MyMuonTracksSelected> const& muons)
+  {
+    runSameSide<pairTypeMuMu, gkEventFillMapWithQvector>(events, muons, perEventsSelectedM);
+  }
+  void processMuonVnCentrSkimmed(soa::Filtered<MyEventsHashSelectedQvectorCentr>& events, soa::Filtered<MyMuonTracksSelected> const& muons)
+  {
+    runSameSide<pairTypeMuMu, gkEventFillMapWithQvectorCentr>(events, muons, perEventsSelectedM);
+  }
+  void processMuonVnExtraSkimmed(soa::Filtered<MyEventsHashSelectedQvectorExtra>& events, soa::Filtered<MyMuonTracksSelected> const& muons)
+  {
+    runSameSide<pairTypeMuMu, gkEventFillMapWithCovQvectorExtraWithRefFlow>(events, muons, perEventsSelectedM);
+  }
+  // TODO: This is a dummy process function for the case when the user does not want to run any of the process functions (no event mixing)
+  //    If there is no process function enabled, the workflow hangs
+  void processDummy(MyEvents&)
+  {
+    // do nothing
+  }
+
+  PROCESS_SWITCH(AnalysisEventMixing, processBarrelSkimmed, "Run barrel-barrel mixing on skimmed tracks", false);
+  PROCESS_SWITCH(AnalysisEventMixing, processMuonSkimmed, "Run muon-muon mixing on skimmed muons", false);
+  PROCESS_SWITCH(AnalysisEventMixing, processBarrelMuonSkimmed, "Run barrel-muon mixing on skimmed tracks/muons", false);
+  PROCESS_SWITCH(AnalysisEventMixing, processBarrelVnSkimmed, "Run barrel-barrel vn mixing on skimmed tracks", false);
+  PROCESS_SWITCH(AnalysisEventMixing, processMuonVnSkimmed, "Run muon-muon vn mixing on skimmed tracks", false);
+  PROCESS_SWITCH(AnalysisEventMixing, processMuonVnCentrSkimmed, "Run muon-muon vn mixing on skimmed tracks from central framework", false);
+  PROCESS_SWITCH(AnalysisEventMixing, processMuonVnExtraSkimmed, "Run muon-muon vn mixing on skimmed tracks from GFW", false);
+  PROCESS_SWITCH(AnalysisEventMixing, processDummy, "Dummy function", false);
+};
+
 // Run the same-event pairing
 // This task assumes that both legs of the resonance fulfill the same cuts (symmetric decay channel)
 //  Runs combinatorics for barrel-barrel, muon-muon and barrel-muon combinations
